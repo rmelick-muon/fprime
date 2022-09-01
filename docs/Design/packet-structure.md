@@ -1,33 +1,59 @@
-A network packet in FPrime is built up from several layers.
+Understanding how an Fprime packet is represented as bit is actually rather complicated, and spread across
+a variety of places within the codebase.
 
-From outside to inside
+It is best to think of a packet as being built from up three layers.
+From outside to inside, those layers are:
+* Framing
+* Common Packet
+* Packet Specific
 
 # Framing
-Framing is 
-
+Framing is the process of wrapping a packet to prepare it for transmission to the ground.
 This is possible to customize by implementing a different `FramingProtocol`
+* 
 * Documentation:
   * https://github.com/nasa/fprime/blob/devel/Svc/Framer/docs/sdd.md
   * https://github.com/nasa/fprime/blob/master/Svc/FramingProtocol/docs/sdd.md
 * Default Implementation: `FPrimeFraming::frame` (https://github.com/nasa/fprime/blob/master/Svc/FramingProtocol/FprimeProtocol.cpp#L24)
 
-If the packet type is unknown.  This would apply to data passed to the Framer over its `comIn` port (telemetry, etc.)
+The default FPrimeFraming ensures that its output always follows the structure
 ```
-FPRIME_START_WORD | size of inner data | inner serialized data (without length) | checksum 
-
-0xDEADBEEF, Data size, ||| inner packet format ||| Checksum
+FPRIME_START_WORD | length of inner data plus packet_type | packet_type | inner data (without length) | checksum
 ```
 
-If the packet type is known.  From reading the [Framer documentation](https://github.com/nasa/fprime/blob/devel/Svc/Framer/docs/sdd.md), this 
-is only ever `FW_PACKET_FILE`, because the framer receives that over its `bufferIn` port.
+The framer has to handle two different types of inputs though: a ComBuffer (through the `comIn` port)
+and a generic buffer (through the `bufferIn` port).
+It achieves this by using the `ComPacket::FW_PACKET_FILE` packet type to handle the generic buffer,
+and relying on the ComBuffer to contain its packet type information.
+
+# Common packet
+The `ComBuffer` is just a way for the different FPrime components to pass around in-memory buffers.  To actually
+understand the structure inside a `ComBuffer`, we need to look at the different components that are connected to the 
+`comIn` port of the Framer.
+
+This will unfortunately depend on how you're structured your FPrime deployment.  It's controlled through either your FPP
+or xml topology.
+
+In the `Ref` application, only two components are connected to the `comIn` port of the framer,
+`chanTlm`, and `eventLogger`.
+
+## chanTlm
+The `chanTlm` uses `Fw::TlmPacket` to create its `ComBuffer`, so it looks like
 ```
-FPRIME_START_WORD | size of inner data and packet_type | packet_type | inner serialized data (without length) | checksum 
-
-0xDEADBEEF, Data size, ||| inner packet format ||| Checksum
+type (FW_PACKET_TELEM) | telemetry channel id | time | telemetry buffer
+```
+(Note: The inclusion of `FW_PACKET_TELEM` and `time` depend on the setting of the `FW_AMPCS_COMPATIBLE` macro)
+## eventLogger
+The `eventLogger` uses `Fw::LogPacket` to create its `ComBuffer`, so it looks like
+```
+type (FW_PACKET_LOG) | time | log buffer
 ```
 
+# Packet specific
+Now, we want to understand the structure of the telemetry buffer or log buffer.
 
 
+# Tracing the configuration and calls between the components
 Framing is called from the following places
 * `comIn_handler`: https://github.com/nasa/fprime/blob/devel/Svc/Framer/Framer.cpp#L48
 * `bufferIn_handler`: https://github.com/nasa/fprime/blob/devel/Svc/Framer/Framer.cpp#L61
@@ -38,8 +64,9 @@ except this does not include the Checksum
 # Connecting to the framer
 The framer has been invoked by data being passed to the [Svc::Framer](https://github.com/nasa/fprime/blob/devel/Svc/Framer/docs/sdd.md)
 
-This is done through the component configuration.  For example, the in [Ref application](https://github.com/nasa/fprime/blob/master/Ref/Top/RefTopologyAppAi.xml#L56) you can see
-First, a component named `downlink` is defined that is a `Framer`.
+This is done through the component configuration.  For example, in the 
+[Ref application](https://github.com/nasa/fprime/blob/master/Ref/Top/RefTopologyAppAi.xml#L56) 
+you can see a component named `downlink` is defined that is a `Framer`.
 ```xml
 <instance namespace="Svc" name="downlink" type="Framer" base_id="0x4100" base_id_window="0"/>
 ```
@@ -76,6 +103,55 @@ So, we now need to examine the implementation of these three objects (`chanTlm`,
 to understand how they create the `const U8* const data` which was passed to the framer.
 
 ## chanTlm (TlmChan)
+`chanTlm` is of `type=TlmChan`.  We want to look at its `PktSend` port, since that's connected to the downlinker.
+
+We need to look at `TlmChanImplTask.cpp` to see how it serializes its data into the `comBuffer`
+It uses a `TlmPacket` (`Fw::TlmPacket m_tlmPacket;` is defined in `TlmChanImpl.hpp`)
+```c++
+this->m_tlmPacket.setId(p_entry->id);
+this->m_tlmPacket.setTimeTag(p_entry->lastUpdate);
+this->m_tlmPacket.setTlmBuffer(p_entry->buffer);
+this->m_comBuffer.resetSer();
+Fw::SerializeStatus stat = this->m_tlmPacket.serialize(this->m_comBuffer);
+FW_ASSERT(Fw::FW_SERIALIZE_OK == stat,static_cast<NATIVE_INT_TYPE>(stat));
+p_entry->updated = false;
+this->PktSend_out(0,this->m_comBuffer,0);
+```
+
+We can then check the implementation inside of `TlmPacket.cpp` (with some of the error checking removed)
+```c++
+#if !FW_AMPCS_COMPATIBLE
+        stat = serializeBase(buffer);
+#endif
+        stat = buffer.serialize(this->m_id);
+
+#if !FW_AMPCS_COMPATIBLE
+        stat = buffer.serialize(this->m_timeTag);
+#endif
+
+        return buffer.serialize(this->m_tlmBuffer.getBuffAddr(),m_tlmBuffer.getBuffLength(),true);
+```
+
+We can see that it uses the macro `FW_AMPCS_COMPATIBLE`.  We can
+read [configuring-fprime.md](../UsersGuide/dev/configuring-fprime.md) to understand its usage.  It is disabled
+by default, so all of those pieces will be serialized.
+
+The `serializeBase` method comes from `ComPacket` (look at `TlmPacket.hpp` to see that `TlmPacket` extends `ComPacket`)
+`TlmPacket` sets its type to `FW_PACKET_TELEM`, so our resulting structure will look like
+```
+FW_PACKET_TELEM | id | time | buffer
+```
+where the `id`, `time`, and `buffer` were all passed in to the `TlmChan`, either through the `Recv` or `Get` ports.
+
+Their types are
+```c++
+FwChanIdType id, Fw::Time &timeTag, Fw::TlmBuffer &val
+```
+
+In `FpConfig.hpp`
+```c++
+typedef U32 FwChanIdType;
+```
 
 ## eventLogger (ActiveLogger)
 `eventLogger` is of `type=ActiveLogger`.   We want to look at its `PktSend` port, since that is connected to the `comIn`
@@ -216,11 +292,16 @@ implementation is found in `PingReceiverComponentImpl`.
 
 
 # List of packet structures
-| Packet        | Generated by | packet structure |
-|---------------|--------------|------------------|
-| file          |              |                  |
-| telemetry     |              |                  | 
-| FW_PACKET_LOG |              |                  |
+| Packet        | Generated by   | inner packet structure                                                                                      |
+|---------------|----------------|-------------------------------------------------------------------------------------------------------------|
+| file          |                |                                                                                                             |
+| telemetry     |                |                                                                                                             | 
+| FW_PACKET_LOG |                |                                                                                                             |
+|               | FprimeProtocol | `FPRIME_START_WORD _ length _ FW_PACKET_FILE _ generic buffer _ checksum`                                   |
+|               | LogPacket      | `FPRIME_START_WORD _ length _ FW_PACKET_LOG _ time _ log buffer   _ checksum`                               |
+|               | TlmPacket      | `FPRIME_START_WORD _ length _ FW_PACKET_TELEM _  telemetry channel id _ time _ telemetry buffer _ checksum` |
+|               |                |                                                                                                             |
+
 
 # Open questions
 * In FprimeFraming::frame, the last line is `m_interface->send(buffer);`.  Does this modify the outgoing
@@ -229,3 +310,4 @@ data in any way, for example adding the length?
 * Best way to include source code links in this documentation
 * How did I get to `Serializable.cpp` from the method call `buffer.serialize(`
 * How to find usages of the `logOut` port within the `SignalGen` components like `SG1`?
+* Could we standardize `ComBuffer`, instead of its format being up to the senders?
